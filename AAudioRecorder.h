@@ -12,18 +12,21 @@
 
 #include "modules/audio_processing/include/audio_processing.h"
 
-
-#include "api/audio/audio_processing_statistics.h"
-#include "webRtcApm/AudioRingBuffer.h"
+#include "lwrb.h"
 
 
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, "NDKRecorder", __VA_ARGS__)
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, "NDKRecorder", __VA_ARGS__)
 
+//10ms
+#define BUFFER_SIZE 960 * 10
 
 class CallbackPCMRecorder {
 public:
-    CallbackPCMRecorder() : stream(nullptr), builder(nullptr) {}
+    CallbackPCMRecorder() : stream(nullptr), builder(nullptr) {
+        lwrb_init(&audio_rb, audio_rb_data, BUFFER_SIZE);
+
+    }
 
     bool start(const char* source, const char* filename) {
         rtcFile.open(filename, std::ios::binary);
@@ -85,21 +88,96 @@ public:
         builder.SetConfig(config);
 
         apm = builder.Create();
-        //
-        // LOGI("webrtc audio processing module create complete");
-        // ringBuffer = std::make_unique<AudioRingBuffer>(480 * 20);
 
-        // running = true;
-        // processingThread = std::thread(&CallbackPCMRecorder::processAudio, this);
-        //
-        // LOGI("webrtc audio processing module thread start....");
-        // processingThread.detach();
+        LOGI("webrtc audio processing module create complete");
 
+        running = true;
+        handlerThread = std::thread(&CallbackPCMRecorder::handlerLoop, this);
 
         return true;
     }
 
+    void handlerLoop() {
+        std::vector<int16_t> pcm(FRAME_SIZE);  // 每次处理 480 帧
+        std::unique_ptr<float[]> inputChannel(new float[FRAME_SIZE]);
+        std::unique_ptr<float[]> outputChannel(new float[FRAME_SIZE]);
+
+        while (running) {
+            std::unique_lock<std::mutex> lock(mutex);
+
+            // 等待环形缓冲区有足够数据
+            rb_cv.wait(lock, [&] {
+                return !running || lwrb_get_full(&audio_rb) >= FRAME_SIZE * sizeof(int16_t);
+            });
+
+            if (!running) break;
+
+            // 从环形缓冲区读取数据
+            size_t bytes_to_read = FRAME_SIZE * sizeof(int16_t);
+            size_t actually_read = lwrb_read(&audio_rb, (uint8_t*)pcm.data(), bytes_to_read);
+
+            lock.unlock();
+
+            // 写入原始 PCM 文件
+            if (sourceFile.is_open()) {
+                sourceFile.write(reinterpret_cast<const char*>(pcm.data()), bytes_to_read);
+            }
+
+            // 转换为 float 数据
+            std::unique_ptr<float[]> inputChannel(new float[480]);
+            std::unique_ptr<float[]> outputChannel(new float[480]);
+
+            for (int i = 0; i < 480; ++i) {
+                inputChannel[i] = pcm[i] / 32767.0f;
+            }
+
+            // 创建 WebRTC APM 配置
+            webrtc::StreamConfig inputConfig(48000, 1);  // 采样率48000Hz，单通道
+            webrtc::StreamConfig outputConfig(48000, 1);
+
+            // 调用 WebRTC APM 进行音频处理
+            float* inputPointer = inputChannel.get();
+            float* outputPointer = outputChannel.get();
+
+            int result = apm->ProcessStream(
+                &inputPointer,  // 输入指针
+                inputConfig,
+                outputConfig,
+                &outputPointer  // 输出指针
+            );
+
+            if (result == 0) {
+                LOGI("Audio processing success!");
+
+                // 转换 float -> int16
+                std::vector<int16_t> processedPCM(FRAME_SIZE);
+                for (int i = 0; i < FRAME_SIZE; ++i) {
+                    processedPCM[i] = static_cast<int16_t>(
+                        std::clamp(outputPointer[i] * 32768.0f, -32768.0f, 32767.0f)
+                    );
+                }
+
+                // 写入文件
+                if (rtcFile.is_open()) {
+                    rtcFile.write(reinterpret_cast<const char*>(processedPCM.data()), FRAME_SIZE * sizeof(int16_t));
+                }
+            } else {
+                LOGI("Audio processing failure!");
+            }
+        }
+    }
+
     void stop() {
+        running = false;
+
+        // 通知线程退出
+        rb_cv.notify_all();
+
+        // 等待线程退出
+        if (handlerThread.joinable()) {
+            handlerThread.join();
+        }
+
         if (stream) {
             AAudioStream_requestStop(stream);
             AAudioStream_close(stream);
@@ -110,8 +188,14 @@ public:
             builder = nullptr;
         }
         if (sourceFile.is_open()) sourceFile.close();
+        if (rtcFile.is_open()) rtcFile.close();
 
         LOGI("Callback PCM recording stopped");
+    }
+
+    // 析构函数也要确保线程已经退出
+    ~CallbackPCMRecorder() {
+        stop();
     }
 
     const int FRAME_SIZE = 480;  // 每次读取 480 帧
@@ -167,7 +251,20 @@ public:
             if (result == 0) {
 
                LOGI("Audio processing success!");
-                writeAudioDataToFile(outputPointer, 480);
+                LOGI("Audio processing success!");
+
+                // 转换 float -> int16
+                std::vector<int16_t> processedPCM(FRAME_SIZE);
+                for (int i = 0; i < FRAME_SIZE; ++i) {
+                    processedPCM[i] = static_cast<int16_t>(
+                        std::clamp(outputPointer[i] * 32768.0f, -32768.0f, 32767.0f)
+                    );
+                }
+
+                // 写入文件
+                if (rtcFile.is_open()) {
+                    rtcFile.write(reinterpret_cast<const char*>(processedPCM.data()), FRAME_SIZE * sizeof(int16_t));
+                }
             } else {
                 LOGI("Audio processing failure!");
             }
@@ -184,12 +281,15 @@ private:
 
     rtc::scoped_refptr<webrtc::AudioProcessing> apm;
 
-    std::unique_ptr<AudioRingBuffer> ringBuffer;  // 环形缓冲区实例
+    // Ring buffer
+    lwrb_t audio_rb;
+    uint8_t audio_rb_data[BUFFER_SIZE];
 
     std::atomic<bool> running{false};
-    std::thread processingThread;
+    std::thread handlerThread;
+
     std::mutex mutex;
-    std::condition_variable cv;
+    std::condition_variable rb_cv;
 
     static constexpr int SAMPLE_RATE = 48000;
     static constexpr int CHANNELS = 1;
@@ -208,12 +308,12 @@ private:
             pcmBuffer[i] = static_cast<int16_t>(std::clamp(output_pointer[i] * 32768.0f, -32768.0f, 32767.0f));
         }
 
-        LOGI("Writing %d frames to file, current file size: %d bytes", numFrames, rtcFile.tellp());
+        // LOGI("Writing %d frames to file, current file size: %d bytes", numFrames, rtcFile.tellp());
 
         // 一次性写入文件
         rtcFile.write(reinterpret_cast<char*>(pcmBuffer.data()), numFrames * sizeof(int16_t));
 
-        LOGI("Processed audio data written to file. %d", numFrames);
+        // LOGI("Processed audio data written to file. %d", numFrames);
     }
 
     static aaudio_data_callback_result_t dataCallback(
@@ -225,11 +325,21 @@ private:
         LOGI("dataCallback invoke audio nums %d", numFrames);
         auto* recorder = static_cast<CallbackPCMRecorder*>(userData);
 
-        recorder->sourceFile.write(static_cast<const char*>(audioData), numFrames * sizeof(int16_t));
+        auto *in = static_cast<int16_t *>(audioData);
+        size_t free_space = lwrb_get_free(&recorder->audio_rb) / sizeof(int16_t);
+        size_t to_write = numFrames;
 
-        // if (!recorder->ringBuffer->push(audioData, numFrames)) {
-        //     LOGE("Failed to push data to buffer.");
-        // }
+        if (to_write > free_space) {
+            to_write = free_space;
+            LOGE("Ring buffer overflow, dropping audio data free_space %zu", free_space);
+        }
+
+        LOGI("Ring buffer, to write audio data to_write %zu", to_write);
+
+        if (to_write > 0) {
+            lwrb_write(&recorder->audio_rb, (uint8_t *) in, to_write * sizeof(int16_t));
+            recorder->rb_cv.notify_one();
+        }
 
         return AAUDIO_CALLBACK_RESULT_CONTINUE;
     }
@@ -304,20 +414,6 @@ private:
         while (running) {
             std::unique_lock<std::mutex> lock(mutex);
 
-            cv.wait(lock, [this]() {
-                return ringBuffer->availableData() >= 480 || !running;
-            });
-
-            if (!running) {
-                LOGI("Stopping process thread, discarding remaining data.");
-                break;
-            }
-
-            // 精确 pop 480 帧
-            if (!ringBuffer->pop(processBuffer, FRAMES_PER_PROCESS)) {
-                LOGE("pop failed unexpectedly");
-                continue;
-            }
 
             lock.unlock();
 

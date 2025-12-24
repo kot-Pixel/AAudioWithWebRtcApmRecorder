@@ -22,8 +22,9 @@ set_target_properties(webrtc_apm PROPERTIES
 add_executable(AAudioRecorder main.cpp
         AAudioRecorder.cpp
         AAudioRecorder.h
-        webRtcApm/AudioRingBuffer.cpp
-        webRtcApm/AudioRingBuffer.h)
+
+        lwrb.c
+        lwrb_ex.c)
 
 target_include_directories(AAudioRecorder PRIVATE
         ${WEBRTC_INCLUDE_DIR}
