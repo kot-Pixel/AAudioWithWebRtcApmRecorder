@@ -31,7 +31,7 @@ set_target_properties(webrtc_apm PROPERTIES
 add_library(deepFliteNet SHARED IMPORTED)
 
 set_target_properties(deepFliteNet PROPERTIES
-        IMPORTED_LOCATION ${DEEP_FLITER_NET_LIB_DIR}/libdf.so
+        IMPORTED_LOCATION ${DEEP_FLITER_NET_LIB_DIR}/libdf.a
 )
 
 

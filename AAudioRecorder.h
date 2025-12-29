@@ -10,6 +10,7 @@
 #include <aaudio/AAudio.h>
 #include <android/log.h>
 
+#include "df.h"
 #include "modules/audio_processing/include/audio_processing.h"
 
 #include "lwrb.h"
@@ -28,9 +29,10 @@ public:
 
     }
 
-    bool start(const char* source, const char* filename) {
+    bool start(const char* source, const char* filename, const char* deepFliterNet) {
         rtcFile.open(filename, std::ios::binary);
         sourceFile.open(source, std::ios::binary);
+        deepFliterNet2File.open(deepFliterNet, std::ios::binary);
         if (!rtcFile.is_open()) {
             LOGE("Failed to open output file");
             return false;
@@ -38,6 +40,11 @@ public:
 
         if (!sourceFile.is_open()) {
             LOGE("Failed to open sourceFile file");
+            return false;
+        }
+
+        if (!deepFliterNet2File.is_open()) {
+            LOGE("Failed to open deepFliterNet2File file");
             return false;
         }
 
@@ -79,8 +86,7 @@ public:
 
         // 配置 AEC、NS、AGC 等
         config.echo_canceller.enabled = true;
-        config.noise_suppression.enabled = true;
-        config.noise_suppression.level = webrtc::AudioProcessing::Config::NoiseSuppression::kHigh;
+        config.noise_suppression.enabled = false;
         config.gain_controller2.enabled = true;
 
         webrtc::AudioProcessingBuilder builder;
@@ -91,29 +97,115 @@ public:
 
         LOGI("webrtc audio processing module create complete");
 
+        state = df_create("/data/local/tmp/DeepFilterNet3_ll_onnx.tar.gz", 20, "info");
+
+        if (state != nullptr) {
+            LOGI("df_create is not null");
+        } else {
+            LOGI("df_create is null");
+        }
+
+
         running = true;
         handlerThread = std::thread(&CallbackPCMRecorder::handlerLoop, this);
+        // handlerThread = std::thread(&CallbackPCMRecorder::handleDeepFliterNet2, this);
 
         return true;
     }
 
+    void handleDeepFliterNet2() {
+        const uintptr_t frame_len = df_get_frame_length(state);
+        // LOGI("DF frame length = %zu samples", frame_len);
+
+        std::vector<int16_t> pcm(frame_len);
+        std::vector<int16_t> pcm_out(frame_len);
+
+        std::vector<float> input(frame_len);
+        std::vector<float> output(frame_len);
+
+        while (running) {
+            std::unique_lock<std::mutex> lock(mutex);
+
+            rb_cv.wait(lock, [&] {
+                return !running ||
+                       lwrb_get_full(&audio_rb) >= frame_len * sizeof(int16_t);
+            });
+
+            if (!running) break;
+
+            size_t bytes_to_read = frame_len * sizeof(int16_t);
+            size_t actually_read =
+                lwrb_read(&audio_rb,
+                          reinterpret_cast<uint8_t*>(pcm.data()),
+                          bytes_to_read);
+
+            lock.unlock();
+
+            // 写入原始 PCM 文件
+            if (sourceFile.is_open()) {
+                sourceFile.write(reinterpret_cast<const char*>(pcm.data()), bytes_to_read);
+            }
+
+            if (actually_read != bytes_to_read) {
+                continue;
+            }
+
+            /* ---------------- int16 -> float ---------------- */
+            for (size_t i = 0; i < frame_len; ++i) {
+                input[i] = pcm[i] / 32768.0f;
+            }
+
+            /* ---------------- DFN 推理 ---------------- */
+            float snr = df_process_frame(state, input.data(), output.data());
+            // (void)snr; // 可用于调试
+
+            // LOGI("df_process_frame snr = %lf", snr);
+
+            /* ---------------- float -> int16 ---------------- */
+            for (size_t i = 0; i < frame_len; ++i) {
+                float v = output[i];
+
+                // 防止溢出
+                if (v > 1.0f) v = 1.0f;
+                if (v < -1.0f) v = -1.0f;
+
+                pcm_out[i] = static_cast<int16_t>(v * 32767.0f);
+            }
+
+            // 写入原始 PCM 文件
+            if (rtcFile.is_open()) {
+                rtcFile.write(reinterpret_cast<const char*>(pcm_out.data()), bytes_to_read);
+            }
+        }
+    }
+
     void handlerLoop() {
-        std::vector<int16_t> pcm(FRAME_SIZE);  // 每次处理 480 帧
-        std::unique_ptr<float[]> inputChannel(new float[FRAME_SIZE]);
-        std::unique_ptr<float[]> outputChannel(new float[FRAME_SIZE]);
+        const size_t frame_len = df_get_frame_length(state); // 一般 480
+        const size_t bytes = frame_len * sizeof(int16_t);
+
+        std::vector<int16_t> pcm(frame_len);
+        std::vector<int16_t> pcm_out(frame_len);
+
+        std::vector<float> apm_in(frame_len);
+        std::vector<float> apm_out(frame_len);
+        std::vector<float> df_out(frame_len);
+
+        webrtc::StreamConfig cfg(SAMPLE_RATE, 1);
+
+        int frame_cnt = 0;
 
         while (running) {
             std::unique_lock<std::mutex> lock(mutex);
 
             // 等待环形缓冲区有足够数据
             rb_cv.wait(lock, [&] {
-                return !running || lwrb_get_full(&audio_rb) >= FRAME_SIZE * sizeof(int16_t);
+                return !running || lwrb_get_full(&audio_rb) >= frame_len * sizeof(int16_t);
             });
 
             if (!running) break;
 
             // 从环形缓冲区读取数据
-            size_t bytes_to_read = FRAME_SIZE * sizeof(int16_t);
+            size_t bytes_to_read = frame_len * sizeof(int16_t);
             size_t actually_read = lwrb_read(&audio_rb, (uint8_t*)pcm.data(), bytes_to_read);
 
             lock.unlock();
@@ -123,12 +215,13 @@ public:
                 sourceFile.write(reinterpret_cast<const char*>(pcm.data()), bytes_to_read);
             }
 
-            // 转换为 float 数据
-            std::unique_ptr<float[]> inputChannel(new float[480]);
-            std::unique_ptr<float[]> outputChannel(new float[480]);
+            if (actually_read != bytes_to_read) {
+                continue;
+            }
 
-            for (int i = 0; i < 480; ++i) {
-                inputChannel[i] = pcm[i] / 32767.0f;
+
+            for (int i = 0; i < frame_len; ++i) {
+                apm_in[i] = pcm[i] / 32767.0f;
             }
 
             // 创建 WebRTC APM 配置
@@ -136,31 +229,43 @@ public:
             webrtc::StreamConfig outputConfig(48000, 1);
 
             // 调用 WebRTC APM 进行音频处理
-            float* inputPointer = inputChannel.get();
-            float* outputPointer = outputChannel.get();
+            float* in = apm_in.data();
+            float* out = apm_out.data();
 
             int result = apm->ProcessStream(
-                &inputPointer,  // 输入指针
+                &in,  // 输入指针
                 inputConfig,
                 outputConfig,
-                &outputPointer  // 输出指针
+                &out  // 输出指针
             );
 
             if (result == 0) {
-                LOGI("Audio processing success!");
+                // LOGI("Audio processing success!");
 
-                // 转换 float -> int16
-                std::vector<int16_t> processedPCM(FRAME_SIZE);
-                for (int i = 0; i < FRAME_SIZE; ++i) {
-                    processedPCM[i] = static_cast<int16_t>(
-                        std::clamp(outputPointer[i] * 32768.0f, -32768.0f, 32767.0f)
-                    );
+                // if (rtcFile.is_open()) {
+                //     rtcFile.write(reinterpret_cast<const char*>(processedPCM.data()), bytes);
+                // }
+
+                //deepFliterNet2
+
+                /* ---------- DeepFilterNet ---------- */
+                float snr = df_process_frame(state, apm_out.data(), df_out.data());
+
+                // LOGI("DF SNR = %.2f dB", snr);
+
+                /* ---------- float -> int16 ---------- */
+                for (size_t i = 0; i < frame_len; ++i) {
+                    float v = df_out[i];
+                    v = std::max(-1.0f, std::min(1.0f, v));
+                    pcm_out[i] = static_cast<int16_t>(v * 32767.0f);
                 }
 
-                // 写入文件
-                if (rtcFile.is_open()) {
-                    rtcFile.write(reinterpret_cast<const char*>(processedPCM.data()), FRAME_SIZE * sizeof(int16_t));
+                /* ---------- 写降噪后的 PCM ---------- */
+                if (deepFliterNet2File.is_open()) {
+                    deepFliterNet2File.write(reinterpret_cast<char*>(pcm_out.data()), bytes);
                 }
+
+
             } else {
                 LOGI("Audio processing failure!");
             }
@@ -278,6 +383,7 @@ private:
     AAudioStreamBuilder* builder;
     std::ofstream rtcFile;
     std::ofstream sourceFile;
+    std::ofstream deepFliterNet2File;
 
     rtc::scoped_refptr<webrtc::AudioProcessing> apm;
 
@@ -290,6 +396,8 @@ private:
 
     std::mutex mutex;
     std::condition_variable rb_cv;
+
+    DFState *state;
 
     static constexpr int SAMPLE_RATE = 48000;
     static constexpr int CHANNELS = 1;
@@ -322,7 +430,7 @@ private:
     void* audioData,
     int32_t numFrames
 ) {
-        LOGI("dataCallback invoke audio nums %d", numFrames);
+        // LOGI("dataCallback invoke audio nums %d", numFrames);
         auto* recorder = static_cast<CallbackPCMRecorder*>(userData);
 
         auto *in = static_cast<int16_t *>(audioData);
@@ -334,7 +442,7 @@ private:
             LOGE("Ring buffer overflow, dropping audio data free_space %zu", free_space);
         }
 
-        LOGI("Ring buffer, to write audio data to_write %zu", to_write);
+        // LOGI("Ring buffer, to write audio data to_write %zu", to_write);
 
         if (to_write > 0) {
             lwrb_write(&recorder->audio_rb, (uint8_t *) in, to_write * sizeof(int16_t));
