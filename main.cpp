@@ -14,7 +14,7 @@ constexpr const char* kDefaultFarPath = "/sdcard/far.pcm";
 void printUsage(const char* program) {
     LOGI("Usage: %s [duration_sec] [far_pcm] [delay_ms]", program);
     LOGI("  duration_sec : run time in seconds (default: %d)", kDefaultDurationSec);
-    LOGI("  far_pcm      : far-end reference PCM, 16k/mono/s16 (default: %s)", kDefaultFarPath);
+    LOGI("  far_pcm      : far-end reference PCM, 48k/mono/s16 (default: %s)", kDefaultFarPath);
     LOGI("  delay_ms     : AEC stream delay (default: %d)", kDefaultDelayMs);
     LOGI("Examples:");
     LOGI("  %s", program);

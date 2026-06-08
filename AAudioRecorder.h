@@ -23,8 +23,8 @@
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, "NDKRecorder", __VA_ARGS__)
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, "NDKRecorder", __VA_ARGS__)
 
-// 10 帧 = 100ms，足够抗系统抖动（实测 rb_full < 128 samples）
-#define BUFFER_SIZE (160 * sizeof(int16_t) * 10)
+// 10 帧 = 100ms
+#define BUFFER_SIZE (480 * sizeof(int16_t) * 10)
 
 class CallbackPCMRecorder {
 public:
@@ -91,9 +91,9 @@ public:
     ~CallbackPCMRecorder() { stop(); }
 
 private:
-    static constexpr int    SAMPLE_RATE = 16000;
+    static constexpr int    SAMPLE_RATE = 48000;
     static constexpr int    CHANNELS    = 1;
-    static constexpr size_t FRAME_LEN   = 160;   // 10ms @ 16kHz
+    static constexpr size_t FRAME_LEN   = 480;   // 10ms @ 48kHz
     static constexpr uint64_t kCbLogInterval = 100;
 
     AAudioStream*        inputStream;
